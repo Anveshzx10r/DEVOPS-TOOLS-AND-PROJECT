@@ -72,10 +72,46 @@ input, select, textarea {
   border-radius: 12px;
   padding: 12px 14px;
   background: #fff;
+  width: 100%;
 }
 
 textarea {
   resize: vertical;
+}
+
+label {
+  display: grid;
+  gap: 7px;
+  color: #33415c;
+  font-size: 0.94rem;
+  font-weight: 600;
+}
+
+.form-section {
+  display: grid;
+  gap: 14px;
+  margin: 0;
+  padding: 16px;
+  border: 1px solid #e1e8fa;
+  border-radius: 14px;
+  background: #fbfcff;
+}
+
+.form-section legend {
+  padding: 0 7px;
+  color: #263f9b;
+  font-weight: 700;
+}
+
+.form-hint {
+  margin: 0;
+  color: #64748b;
+  font-size: 0.9rem;
+}
+
+.primary-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .primary-btn {
@@ -224,6 +260,94 @@ textarea {
   gap: 18px;
 }
 
+.section-heading, .request-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 18px;
+}
+
+.search-input {
+  max-width: 360px;
+}
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+.table-actions {
+  display: flex;
+  gap: 12px;
+  white-space: nowrap;
+}
+
+.empty-state {
+  text-align: center;
+  color: #64748b;
+  padding: 28px;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin: 22px 0;
+}
+
+.detail-grid > div {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border-radius: 12px;
+  background: #f7f9ff;
+}
+
+.detail-grid strong {
+  color: #5b6985;
+  font-size: 0.84rem;
+}
+
+.details-block {
+  display: grid;
+  gap: 10px;
+  margin: 22px 0;
+}
+
+.history-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #edf1ff;
+}
+
+.history-item > div {
+  display: grid;
+  gap: 3px;
+}
+
+.history-item small {
+  color: #64748b;
+}
+
+.history-item p {
+  margin: 4px 0 0;
+}
+
+.history-dot {
+  width: 10px;
+  height: 10px;
+  margin-top: 6px;
+  border-radius: 50%;
+  background: #4567dd;
+  flex: 0 0 auto;
+}
+
+.inline-button {
+  display: inline-block;
+  text-align: center;
+}
+
 .card {
   background: rgba(255, 255, 255, 0.94);
   border: 1px solid #dfe8ff;
@@ -299,6 +423,18 @@ th, td {
   }
 
   .grid-form {
+    grid-template-columns: 1fr;
+  }
+
+  .section-heading, .request-title-row {
+    display: grid;
+  }
+
+  .search-input {
+    max-width: none;
+  }
+
+  .detail-grid {
     grid-template-columns: 1fr;
   }
 }

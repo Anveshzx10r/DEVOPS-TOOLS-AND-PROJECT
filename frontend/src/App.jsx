@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Link, Navigate, Route, Routes, useNavigate } from 'react-router-dom';
+import { Link, Navigate, Route, Routes, useNavigate, useParams } from 'react-router-dom';
 
 const API = '/api';
 
@@ -236,24 +236,49 @@ function RegisterPage() {
 function StudentDashboard() {
   const [requests, setRequests] = useState([]);
   const [summary, setSummary] = useState({ totalRequests: 0, pendingRequests: 0, approvedRequests: 0, rejectedRequests: 0, returnedRequests: 0 });
-  const [departments, setDepartments] = useState([]);
   const [requestTypes, setRequestTypes] = useState([]);
-  const [form, setForm] = useState({ subject: '', description: '', reason: '', request_type_id: '1', department_id: '1' });
+  const [faculty, setFaculty] = useState([]);
+  const [form, setForm] = useState({ subject: '', description: '', reason: '', request_type_id: '', assigned_faculty_id: '' });
   const [files, setFiles] = useState([]);
   const [message, setMessage] = useState('');
+  const [messageType, setMessageType] = useState('success');
+  const [departmentName, setDepartmentName] = useState('your department');
   const user = JSON.parse(localStorage.getItem('permission-user') || 'null');
 
   useEffect(() => {
     fetchRequests();
-    fetch(`${API}/departments`, { credentials: 'include' }).then(async (r) => {
-      const data = await r.json();
-      if (data.departments) setDepartments(data.departments);
-    });
-    fetch(`${API}/request-types`, { credentials: 'include' }).then(async (r) => {
-      const data = await r.json();
-      if (data.requestTypes) setRequestTypes(data.requestTypes);
-    });
-  }, []);
+    async function loadFormOptions() {
+      try {
+        const [typeResponse, departmentResponse, facultyResponse] = await Promise.all([
+          fetch(`${API}/request-types`, { credentials: 'include' }),
+          fetch(`${API}/departments`, { credentials: 'include' }),
+          fetch(`${API}/departments/${user.department_id}/faculty`, { credentials: 'include' }),
+        ]);
+        const [typeData, departmentData, facultyData] = await Promise.all([
+          typeResponse.json(),
+          departmentResponse.json(),
+          facultyResponse.json(),
+        ]);
+        if (!typeResponse.ok || !departmentResponse.ok || !facultyResponse.ok) {
+          throw new Error(facultyData.message || typeData.message || departmentData.message || 'Could not load request options.');
+        }
+        const types = typeData.requestTypes || [];
+        const availableFaculty = facultyData.faculty || [];
+        setRequestTypes(types);
+        setFaculty(availableFaculty);
+        setDepartmentName(departmentData.departments?.find((department) => department.id === user.department_id)?.department_name || 'your department');
+        setForm((current) => ({
+          ...current,
+          request_type_id: current.request_type_id || String(types[0]?.id || ''),
+          assigned_faculty_id: current.assigned_faculty_id || String(availableFaculty[0]?.id || ''),
+        }));
+      } catch (error) {
+        setMessage(error.message);
+        setMessageType('error');
+      }
+    }
+    loadFormOptions();
+  }, [user.department_id]);
 
   const fetchRequests = async () => {
     const response = await fetch(`${API}/requests`, { credentials: 'include' });
@@ -272,16 +297,38 @@ function StudentDashboard() {
 
   const submitRequest = async (e) => {
     e.preventDefault();
+    setMessage('');
     const fd = new FormData();
     Object.entries(form).forEach(([key, value]) => fd.append(key, value));
     files.forEach((file) => fd.append('documents', file));
     const response = await fetch(`${API}/requests`, { method: 'POST', body: fd, credentials: 'include' });
     const data = await response.json();
-    if (!response.ok) return setMessage(data.message || 'Request failed');
+    if (!response.ok) {
+      setMessageType('error');
+      return setMessage(data.message || 'Request failed');
+    }
+    setMessageType('success');
     setMessage(data.message || 'Request submitted');
-    setForm({ subject: '', description: '', reason: '', request_type_id: '1', department_id: '1' });
+    setForm((current) => ({ ...current, subject: '', description: '', reason: '' }));
     setFiles([]);
     fetchRequests();
+  };
+
+  const selectDocuments = (event) => {
+    const selected = Array.from(event.target.files || []);
+    const allowedTypes = ['application/pdf', 'image/jpeg', 'image/png'];
+    const invalidFile = selected.find((file) => !allowedTypes.includes(file.type) || file.size > 10 * 1024 * 1024);
+    if (selected.length > 5 || invalidFile) {
+      setFiles([]);
+      event.target.value = '';
+      setMessageType('error');
+      setMessage(selected.length > 5
+        ? 'You can attach up to five documents.'
+        : `${invalidFile.name} must be a PDF, JPG, or PNG no larger than 10 MB.`);
+      return;
+    }
+    setFiles(selected);
+    setMessage('');
   };
 
   return (
@@ -295,20 +342,59 @@ function StudentDashboard() {
       </div>
       <div className="panel-grid">
         <section className="card">
-          <h3>Create Permission Request</h3>
+          <h3>New permission request</h3>
+          <p className="muted">Your request will be reviewed by your selected faculty member first, then sent to the HOD.</p>
           <form className="stack-form" onSubmit={submitRequest}>
-            <select value={form.request_type_id} onChange={(e) => setForm({ ...form, request_type_id: e.target.value })}>
-              {requestTypes.map((type) => <option key={type.id} value={type.id}>{type.name}</option>)}
-            </select>
-            <select value={form.department_id} onChange={(e) => setForm({ ...form, department_id: e.target.value })}>
-              {departments.map((d) => <option key={d.id} value={d.id}>{d.department_name}</option>)}
-            </select>
-            <input value={form.subject} onChange={(e) => setForm({ ...form, subject: e.target.value })} placeholder="Subject" />
-            <textarea value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="Description" rows="4" />
-            <textarea value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} placeholder="Reason" rows="3" />
-            <input type="file" multiple onChange={(e) => setFiles([...e.target.files])} />
-            {message ? <div className="success-box">{message}</div> : null}
-            <button type="submit" className="primary-btn">Submit Request</button>
+            <fieldset className="form-section">
+              <legend>1. Request details</legend>
+              <label>Department
+                <input value={departmentName} readOnly aria-readonly="true" />
+              </label>
+              <label>Request type
+                <select value={form.request_type_id} onChange={(e) => setForm({ ...form, request_type_id: e.target.value })} required>
+                  <option value="">Choose a request type</option>
+                  {requestTypes.map((type) => <option key={type.id} value={type.id}>{type.name}</option>)}
+                </select>
+              </label>
+              <label>Subject
+                <input value={form.subject} onChange={(e) => setForm({ ...form, subject: e.target.value })} placeholder="For example: Permission to attend a workshop" required />
+              </label>
+              <label>What permission do you need?
+                <textarea value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="Describe the dates, place, activity, or other important details." rows="4" required />
+              </label>
+              <label>Reason for your request
+                <textarea value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} placeholder="Explain why you need this permission." rows="3" required />
+              </label>
+            </fieldset>
+            <fieldset className="form-section">
+              <legend>2. Who are you requesting permission from?</legend>
+              <label>Reviewing faculty member
+                <select
+                  value={form.assigned_faculty_id}
+                  onChange={(e) => setForm({ ...form, assigned_faculty_id: e.target.value })}
+                  required
+                  disabled={!faculty.length}
+                >
+                  <option value="">Choose a faculty member</option>
+                  {faculty.map((member) => (
+                    <option key={member.id} value={member.id}>
+                      {member.name}{member.designation ? ` - ${member.designation}` : ''}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p className="form-hint">After faculty review, the request automatically goes to your department HOD.</p>
+            </fieldset>
+            <fieldset className="form-section">
+              <legend>3. Supporting documents</legend>
+              <label>Attachments (PDF, JPG or PNG; up to 10 MB each)
+                <input type="file" accept=".pdf,.jpg,.jpeg,.png" multiple onChange={selectDocuments} />
+              </label>
+            </fieldset>
+            {message ? <div className={messageType === 'error' ? 'error-box' : 'success-box'} role="status">{message}</div> : null}
+            <button type="submit" className="primary-btn" disabled={!faculty.length || !requestTypes.length}>
+              Submit request to faculty
+            </button>
           </form>
         </section>
         <section className="card">
@@ -321,7 +407,7 @@ function StudentDashboard() {
               {requests.slice(0, 6).map((req) => (
                 <tr key={req.id}>
                   <td>{req.request_number}</td>
-                  <td>{requestTypes.find((t) => t.id === req.request_type_id)?.name || 'Request'}</td>
+                  <td>{req.requestType?.name || 'Request'}</td>
                   <td>{getStatusBadge(req.status)}</td>
                   <td><a href={`/api/requests/${req.id}/pdf`} target="_blank">PDF</a></td>
                 </tr>
@@ -353,7 +439,11 @@ function FacultyDashboard() {
       body: JSON.stringify({ remarks: 'Processed via portal' }),
     });
     const data = await res.json();
-    alert(data.message || 'Action performed');
+    if (!res.ok) {
+      alert(data.message || 'Could not process this request.');
+      return;
+    }
+    alert(data.message || 'Action completed.');
     fetchRequests();
   };
 
@@ -373,13 +463,17 @@ function FacultyDashboard() {
             {requests.map((req) => (
               <tr key={req.id}>
                 <td>{req.request_number}</td>
-                <td>{req.student_id}</td>
-                <td>{req.subject}</td>
+                <td>{req.user?.name || 'Student'}<br /><small>{req.student?.roll_number}</small></td>
+                <td>{req.requestType?.name}<br /><small>{req.subject}</small></td>
                 <td>{getStatusBadge(req.status)}</td>
                 <td>
-                  <button onClick={() => act(req.id, 'approve')}>Approve</button>
-                  <button onClick={() => act(req.id, 'reject')}>Reject</button>
-                  <button onClick={() => act(req.id, 'forward')}>Forward</button>
+                  {req.current_approver_id === user.id && ['SUBMITTED', 'UNDER FACULTY REVIEW'].includes(req.status) ? (
+                    <>
+                      <button onClick={() => act(req.id, 'approve')}>Approve & send to HOD</button>
+                      <button onClick={() => act(req.id, 'reject')}>Reject</button>
+                      <button onClick={() => act(req.id, 'return')}>Return for correction</button>
+                    </>
+                  ) : <span className="muted">No action required</span>}
                 </td>
               </tr>
             ))}
@@ -408,7 +502,11 @@ function HodDashboard() {
       body: JSON.stringify({ remarks: 'Reviewed by HOD' }),
     });
     const data = await res.json();
-    alert(data.message || 'Action performed');
+    if (!res.ok) {
+      alert(data.message || 'Could not process this request.');
+      return;
+    }
+    alert(data.message || 'Action completed.');
     fetchRequests();
   };
 
@@ -417,7 +515,7 @@ function HodDashboard() {
       <div className="stats-grid">
         <StatCard label="Department Requests" value={requests.length} />
         <StatCard label="Pending Approvals" value={requests.filter((r) => !['APPROVED', 'REJECTED'].includes(r.status)).length} />
-        <StatCard label="Approved" value={requests.filter((r) => r.status === 'HOD APPROVED').length} />
+        <StatCard label="Approved" value={requests.filter((r) => r.status === 'APPROVED').length} />
         <StatCard label="Rejected" value={requests.filter((r) => r.status === 'REJECTED').length} />
       </div>
       <section className="card">
@@ -428,12 +526,16 @@ function HodDashboard() {
             {requests.map((req) => (
               <tr key={req.id}>
                 <td>{req.request_number}</td>
-                <td>{req.subject}</td>
+                <td>{req.user?.name}<br /><small>{req.student?.roll_number} · {req.requestType?.name} · {req.subject}</small></td>
                 <td>{getStatusBadge(req.status)}</td>
                 <td>
-                  <button onClick={() => act(req.id, 'approve')}>Approve</button>
-                  <button onClick={() => act(req.id, 'reject')}>Reject</button>
-                  <button onClick={() => act(req.id, 'forward')}>Forward</button>
+                  {req.current_approver_id === user.id ? (
+                    <>
+                      <button onClick={() => act(req.id, 'approve')}>Approve request</button>
+                      <button onClick={() => act(req.id, 'reject')}>Reject</button>
+                      <button onClick={() => act(req.id, 'return')}>Return for correction</button>
+                    </>
+                  ) : <span className="muted">No action required</span>}
                 </td>
               </tr>
             ))}
@@ -462,7 +564,11 @@ function PrincipalDashboard() {
       body: JSON.stringify({ remarks: 'Principal review' }),
     });
     const data = await res.json();
-    alert(data.message || 'Action performed');
+    if (!res.ok) {
+      alert(data.message || 'Could not process this request.');
+      return;
+    }
+    alert(data.message || 'Action completed.');
     fetchRequests();
   };
 
@@ -482,11 +588,16 @@ function PrincipalDashboard() {
             {requests.map((req) => (
               <tr key={req.id}>
                 <td>{req.request_number}</td>
-                <td>{req.subject}</td>
+                <td>{req.user?.name}<br /><small>{req.student?.roll_number} · {req.requestType?.name} · {req.subject}</small></td>
                 <td>{getStatusBadge(req.status)}</td>
                 <td>
-                  <button onClick={() => act(req.id, 'approve')}>Approve</button>
-                  <button onClick={() => act(req.id, 'reject')}>Reject</button>
+                  {req.current_approver_id === user.id ? (
+                    <>
+                      <button onClick={() => act(req.id, 'approve')}>Approve</button>
+                      <button onClick={() => act(req.id, 'reject')}>Reject</button>
+                      <button onClick={() => act(req.id, 'return')}>Return for correction</button>
+                    </>
+                  ) : <span className="muted">No action required</span>}
                 </td>
               </tr>
             ))}
@@ -548,6 +659,162 @@ function DeveloperDashboard() {
   );
 }
 
+function RequestsPage() {
+  const [requests, setRequests] = useState([]);
+  const [search, setSearch] = useState('');
+  const [error, setError] = useState('');
+  const user = JSON.parse(localStorage.getItem('permission-user') || 'null');
+
+  useEffect(() => {
+    fetch(`${API}/requests`, { credentials: 'include' })
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.message || 'Could not load requests.');
+        setRequests(data.requests || []);
+      })
+      .catch((loadError) => setError(loadError.message));
+  }, []);
+
+  const visibleRequests = requests.filter((request) =>
+    `${request.request_number} ${request.requestType?.name || ''} ${request.status}`.toLowerCase().includes(search.toLowerCase()),
+  );
+
+  return (
+    <DashboardLayout user={user} title="Requests">
+      <section className="card">
+        <div className="section-heading">
+          <div>
+            <h3>Request tracking</h3>
+            <p className="muted">Search requests and open a request to view its review history.</p>
+          </div>
+          <input className="search-input" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search request ID, type, or status" />
+        </div>
+        {error ? <div className="error-box">{error}</div> : null}
+        <div className="table-scroll">
+          <table>
+            <thead><tr><th>Request ID</th><th>Type</th><th>Subject</th><th>Submitted</th><th>Status</th><th>Actions</th></tr></thead>
+            <tbody>
+              {visibleRequests.map((request) => (
+                <tr key={request.id}>
+                  <td>{request.request_number}</td>
+                  <td>{request.requestType?.name || 'Request'}</td>
+                  <td>{request.subject}</td>
+                  <td>{new Date(request.created_at).toLocaleDateString()}</td>
+                  <td>{getStatusBadge(request.status)}</td>
+                  <td className="table-actions">
+                    <Link to={`/requests/${request.id}`}>Track details</Link>
+                    <a href={`${API}/requests/${request.id}/pdf`} target="_blank" rel="noreferrer">PDF</a>
+                  </td>
+                </tr>
+              ))}
+              {!visibleRequests.length ? <tr><td colSpan="6" className="empty-state">No requests match your search.</td></tr> : null}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </DashboardLayout>
+  );
+}
+
+function RequestDetailsPage() {
+  const { id } = useParams();
+  const [request, setRequest] = useState(null);
+  const [error, setError] = useState('');
+  const user = JSON.parse(localStorage.getItem('permission-user') || 'null');
+
+  useEffect(() => {
+    fetch(`${API}/requests/${id}`, { credentials: 'include' })
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.message || 'Could not load request.');
+        setRequest(data.request);
+      })
+      .catch((loadError) => setError(loadError.message));
+  }, [id]);
+
+  return (
+    <DashboardLayout user={user} title="Request details">
+      <section className="card">
+        <Link to="/requests">← Back to requests</Link>
+        {error ? <div className="error-box">{error}</div> : null}
+        {!request && !error ? <p className="muted">Loading request…</p> : null}
+        {request ? (
+          <>
+            <div className="request-title-row">
+              <div>
+                <h2>{request.subject}</h2>
+                <p className="muted">{request.request_number} · {request.requestType?.name} · {request.department?.department_name}</p>
+              </div>
+              {getStatusBadge(request.status)}
+            </div>
+            <div className="detail-grid">
+              <div><strong>Submitted by</strong><span>{request.user?.name} · {request.student?.roll_number}</span></div>
+              <div><strong>Faculty recipient</strong><span>{request.assignedFaculty?.name || 'Not assigned'}</span></div>
+              <div><strong>Current reviewer</strong><span>{request.currentApprover?.name || 'Review complete'}</span></div>
+              <div><strong>Submitted on</strong><span>{new Date(request.created_at).toLocaleString()}</span></div>
+              <div><strong>Request details</strong><span>{request.description}</span></div>
+              <div><strong>Reason</strong><span>{request.reason}</span></div>
+            </div>
+            {request.documents?.length ? (
+              <div className="details-block">
+                <h3>Supporting documents</h3>
+                {request.documents.map((document) => <a key={document.id} href={document.file_path} target="_blank" rel="noreferrer">{document.original_name}</a>)}
+              </div>
+            ) : null}
+            <div className="details-block">
+              <h3>Review history</h3>
+              {request.history?.length ? request.history.map((item) => (
+                <div className="history-item" key={item.id}>
+                  <span className="history-dot" />
+                  <div><strong>{item.stage}: {item.action}</strong><small>{new Date(item.created_at).toLocaleString()}</small>{item.remarks ? <p>{item.remarks}</p> : null}</div>
+                </div>
+              )) : <p className="muted">No review actions have been recorded yet.</p>}
+            </div>
+            <a className="primary-btn inline-button" href={`${API}/requests/${request.id}/pdf`} target="_blank" rel="noreferrer">Download letter PDF</a>
+          </>
+        ) : null}
+      </section>
+    </DashboardLayout>
+  );
+}
+
+function ProfilePage() {
+  const [profile, setProfile] = useState(null);
+  const [error, setError] = useState('');
+  const user = JSON.parse(localStorage.getItem('permission-user') || 'null');
+
+  useEffect(() => {
+    fetch(`${API}/profile`, { credentials: 'include' })
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.message || 'Could not load profile.');
+        setProfile(data.profile);
+      })
+      .catch((loadError) => setError(loadError.message));
+  }, []);
+
+  return (
+    <DashboardLayout user={user} title="My profile">
+      <section className="card profile-card">
+        <h3>Account information</h3>
+        {error ? <div className="error-box">{error}</div> : null}
+        {profile ? (
+          <div className="detail-grid">
+            <div><strong>Name</strong><span>{profile.user.name}</span></div>
+            <div><strong>Email</strong><span>{profile.user.email}</span></div>
+            <div><strong>Role</strong><span>{profile.user.role}</span></div>
+            <div><strong>Department</strong><span>{profile.department?.department_name || 'Institution-wide'}</span></div>
+            {profile.student ? <>
+              <div><strong>Roll number</strong><span>{profile.student.roll_number}</span></div>
+              <div><strong>Year and section</strong><span>{profile.student.year} · {profile.student.section}</span></div>
+            </> : null}
+          </div>
+        ) : !error ? <p className="muted">Loading profile…</p> : null}
+      </section>
+    </DashboardLayout>
+  );
+}
+
 function StatCard({ label, value }) {
   return (
     <div className="stat-card">
@@ -579,6 +846,9 @@ export default function App() {
       <Route path="/hod-dashboard" element={<ProtectedRoute user={user} role="HOD"><HodDashboard /></ProtectedRoute>} />
       <Route path="/principal-dashboard" element={<ProtectedRoute user={user} role="PRINCIPAL"><PrincipalDashboard /></ProtectedRoute>} />
       <Route path="/developer-dashboard" element={<ProtectedRoute user={user} role="DEVELOPER"><DeveloperDashboard /></ProtectedRoute>} />
+      <Route path="/requests" element={<ProtectedRoute user={user}><RequestsPage /></ProtectedRoute>} />
+      <Route path="/requests/:id" element={<ProtectedRoute user={user}><RequestDetailsPage /></ProtectedRoute>} />
+      <Route path="/profile" element={<ProtectedRoute user={user}><ProfilePage /></ProtectedRoute>} />
     </Routes>
   );
 }

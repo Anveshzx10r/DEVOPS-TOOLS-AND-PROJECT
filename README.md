@@ -5,10 +5,13 @@ A full-stack permission management platform for colleges and universities built 
 ## Features
 
 - Student registration and login
+- Department-scoped faculty recipient selection, including CSE - Data Science
+- Guided request form split into request details, reviewer, and attachments
 - Separate developer/admin portal at `/developer/login`
 - Role-based access for Student, Faculty, HOD, Principal, and Developer
 - Request creation with file attachments
-- Workflow-driven approval flow
+- Sequential faculty-to-HOD review with reviewer assignment and notifications
+- Request tracking page with approval history and generated letters
 - Digital PDF letter generation
 - Internal notifications and audit logging
 - Department and request type management
@@ -21,6 +24,8 @@ A full-stack permission management platform for colleges and universities built 
 - Faculty: `faculty.cse1@abccollege.edu` / `Faculty@123`
 - HOD: `hod.cse@abccollege.edu` / `Hod@123`
 - Principal: `principal@abccollege.edu` / `Principal@123`
+- CSE - Data Science HOD: `hod.csedatascience@abccollege.edu` / `Hod@123`
+- CSE - Data Science faculty: `faculty.csedatascience@abccollege.edu` / `Faculty@123`
 
 ## Local setup
 
@@ -51,3 +56,5 @@ The app will start on:
 - PDF generation is handled with `pdfkit`.
 - The backend uses secure JWT auth and bcrypt password hashing.
 - The application uses a local SQLite file in `backend/data/permission.db`.
+- Student requests are routed only to a faculty member from the student's own department. Faculty approval sends the request to that department's HOD.
+- For Docker/production, set a unique `JWT_SECRET` environment variable before starting the container.

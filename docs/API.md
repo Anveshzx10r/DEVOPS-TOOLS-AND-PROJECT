@@ -10,11 +10,13 @@
 ## Departments and requests
 
 - GET `/api/departments`
+- GET `/api/departments/:id/faculty`
 - POST `/api/departments`
 - GET `/api/request-types`
 - GET `/api/requests`
 - POST `/api/requests`
 - GET `/api/requests/:id`
+- GET `/api/profile`
 - POST `/api/requests/:id/approve`
 - POST `/api/requests/:id/reject`
 - POST `/api/requests/:id/return`

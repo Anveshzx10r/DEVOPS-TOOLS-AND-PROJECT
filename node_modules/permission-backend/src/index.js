@@ -21,7 +21,8 @@ const workspaceRoot = path.resolve(rootDir, '..');
 const uploadDir = path.join(rootDir, 'uploads');
 const dataDir = path.join(rootDir, 'data');
 const dbFile = path.join(dataDir, 'permission.db');
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
+const JWT_SECRET = process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? '' : 'dev-secret-change-me');
+if (!JWT_SECRET) throw new Error('JWT_SECRET must be set in production.');
 
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
@@ -130,6 +131,8 @@ CREATE TABLE IF NOT EXISTS requests (
   subject TEXT NOT NULL,
   description TEXT,
   reason TEXT,
+  assigned_faculty_id INTEGER,
+  current_approver_id INTEGER,
   status TEXT NOT NULL,
   current_stage TEXT,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -217,6 +220,13 @@ CREATE TABLE IF NOT EXISTS system_settings (
 `;
 
 db.exec(schemaSql);
+const requestColumns = queryAll('PRAGMA table_info(requests)').map((column) => column.name);
+if (!requestColumns.includes('assigned_faculty_id')) {
+  db.exec('ALTER TABLE requests ADD COLUMN assigned_faculty_id INTEGER');
+}
+if (!requestColumns.includes('current_approver_id')) {
+  db.exec('ALTER TABLE requests ADD COLUMN current_approver_id INTEGER');
+}
 persistDb();
 
 const defaultSettings = [
@@ -344,16 +354,12 @@ function ensureWorkflowDefinitions() {
     if (!existing) {
       execute('INSERT INTO workflow_definitions (request_type_id, department_id, name, is_active) VALUES (?, NULL, ?, 1)', [type.id, `${type.name} default workflow`]);
       const workflowId = queryRow('SELECT id FROM workflow_definitions WHERE request_type_id = ? AND department_id IS NULL', [type.id]).id;
-      const steps = [
-        { role: 'FACULTY', step_name: 'Faculty Review' },
-        { role: 'HOD', step_name: 'HOD Approval' },
-        { role: 'PRINCIPAL', step_name: 'Principal Approval' },
-      ];
-      let seq = 1;
-      for (const step of steps) {
-        execute('INSERT INTO workflow_steps (workflow_id, sequence_no, role, step_name) VALUES (?, ?, ?, ?)', [workflowId, seq, step.role, step.step_name]);
-        seq += 1;
-      }
+      execute('INSERT INTO workflow_steps (workflow_id, sequence_no, role, step_name) VALUES (?, ?, ?, ?)', [workflowId, 1, 'FACULTY', 'Faculty Review']);
+      execute('INSERT INTO workflow_steps (workflow_id, sequence_no, role, step_name) VALUES (?, ?, ?, ?)', [workflowId, 2, 'HOD', 'HOD Approval']);
+    } else if (existing.name === `${type.name} default workflow`) {
+      execute('DELETE FROM workflow_steps WHERE workflow_id = ?', [existing.id]);
+      execute('INSERT INTO workflow_steps (workflow_id, sequence_no, role, step_name) VALUES (?, ?, ?, ?)', [existing.id, 1, 'FACULTY', 'Faculty Review']);
+      execute('INSERT INTO workflow_steps (workflow_id, sequence_no, role, step_name) VALUES (?, ?, ?, ?)', [existing.id, 2, 'HOD', 'HOD Approval']);
     }
   }
 }
@@ -380,6 +386,21 @@ function getHodProfile(userId) {
   return queryRow('SELECT * FROM hods WHERE user_id = ?', [userId]);
 }
 
+function getActiveHodUserId(departmentId) {
+  const hod = queryRow(
+    `SELECT h.user_id
+     FROM hods h JOIN users u ON u.id = h.user_id
+     WHERE h.department_id = ? AND h.is_active = 1 AND u.is_active = 1
+     ORDER BY h.id LIMIT 1`,
+    [departmentId],
+  );
+  return hod?.user_id || null;
+}
+
+function getActivePrincipalUserId() {
+  return queryRow('SELECT id FROM users WHERE role = ? AND is_active = 1 ORDER BY id LIMIT 1', ['PRINCIPAL'])?.id || null;
+}
+
 function getApproverProfileForRequest(requestId) {
   return queryRow('SELECT * FROM approvals WHERE request_id = ? ORDER BY approved_at DESC LIMIT 1', [requestId]);
 }
@@ -400,7 +421,13 @@ function buildRequestResponse(request) {
   const department = getDepartmentById(request.department_id);
   const requestType = getRequestTypeById(request.request_type_id);
   const documents = queryAll('SELECT * FROM request_documents WHERE request_id = ?', [request.id]);
-  return { ...request, student, user, department, requestType, documents };
+  const assignedFaculty = request.assigned_faculty_id
+    ? safeUserJson(queryRow('SELECT * FROM users WHERE id = ?', [request.assigned_faculty_id]))
+    : null;
+  const currentApprover = request.current_approver_id
+    ? safeUserJson(queryRow('SELECT * FROM users WHERE id = ?', [request.current_approver_id]))
+    : null;
+  return { ...request, student, user, department, requestType, assignedFaculty, currentApprover, documents };
 }
 
 function safeUserJson(user) {
@@ -478,9 +505,46 @@ app.get('/api/auth/me', authenticate, (req, res) => {
   return res.json({ user });
 });
 
+app.get('/api/profile', authenticate, (req, res) => {
+  const department = req.user.department_id
+    ? queryRow('SELECT id, department_code, department_name FROM departments WHERE id = ?', [req.user.department_id])
+    : null;
+  const student = req.user.role === 'STUDENT' ? getStudentProfile(req.user.id) : null;
+  const faculty = req.user.role === 'FACULTY' ? getFacultyProfile(req.user.id) : null;
+  const hod = req.user.role === 'HOD' ? getHodProfile(req.user.id) : null;
+  return res.json({ profile: { user: safeUserJson(req.user), department, student, faculty, hod } });
+});
+
 app.get('/api/departments', authenticate, (req, res) => {
   const dept = queryAll('SELECT * FROM departments WHERE is_active = 1 ORDER BY department_name ASC');
   return res.json({ departments: dept });
+});
+
+app.get('/api/departments/:id/faculty', authenticate, (req, res) => {
+  const departmentId = Number(req.params.id);
+  if (!Number.isInteger(departmentId)) return res.status(400).json({ message: 'Invalid department.' });
+  if (req.user.role === 'STUDENT') {
+    const student = getStudentProfile(req.user.id);
+    if (!student || student.department_id !== departmentId) {
+      return res.status(403).json({ message: 'You can only select faculty from your own department.' });
+    }
+  } else if (req.user.role === 'FACULTY' || req.user.role === 'HOD') {
+    const profile = req.user.role === 'FACULTY' ? getFacultyProfile(req.user.id) : getHodProfile(req.user.id);
+    if (!profile || profile.department_id !== departmentId) {
+      return res.status(403).json({ message: 'You can only access faculty in your own department.' });
+    }
+  } else if (!['DEVELOPER', 'PRINCIPAL'].includes(req.user.role)) {
+    return res.status(403).json({ message: 'Access denied.' });
+  }
+
+  const faculty = queryAll(
+    `SELECT u.id, u.name, u.email, f.designation, f.is_class_incharge
+     FROM faculty f JOIN users u ON u.id = f.user_id
+     WHERE f.department_id = ? AND u.is_active = 1
+     ORDER BY f.is_class_incharge DESC, u.name ASC`,
+    [departmentId],
+  );
+  return res.json({ faculty });
 });
 
 app.post('/api/departments', authenticate, requireRole('DEVELOPER'), (req, res) => {
@@ -645,7 +709,7 @@ function canAccessRequest(user, request) {
   if (user.role === 'FACULTY') {
     const profile = getFacultyProfile(user.id);
     if (!profile) return false;
-    return profile.department_id === request.department_id;
+    return profile.department_id === request.department_id && request.assigned_faculty_id === user.id;
   }
   if (user.role === 'HOD') {
     const profile = getHodProfile(user.id);
@@ -669,28 +733,14 @@ const allowedTransitions = {
 };
 
 function isTransitionAllowed(currentStatus, action, role) {
-  const map = {
-    STUDENT_SUBMIT: 'SUBMITTED',
-    FACULTY_APPROVE: ['SUBMITTED', 'UNDER FACULTY REVIEW'],
-    FACULTY_REJECT: ['SUBMITTED', 'UNDER FACULTY REVIEW'],
-    FACULTY_FORWARD: ['SUBMITTED', 'UNDER FACULTY REVIEW'],
-    FACULTY_RETURN: ['SUBMITTED', 'UNDER FACULTY REVIEW'],
-    HOD_APPROVE: ['FACULTY APPROVED', 'UNDER HOD REVIEW'],
-    HOD_REJECT: ['FACULTY APPROVED', 'UNDER HOD REVIEW'],
-    HOD_FORWARD: ['FACULTY APPROVED', 'UNDER HOD REVIEW'],
-    PRINCIPAL_APPROVE: ['HOD APPROVED', 'UNDER PRINCIPAL REVIEW'],
-    PRINCIPAL_REJECT: ['HOD APPROVED', 'UNDER PRINCIPAL REVIEW'],
-    PRINCIPAL_RETURN: ['HOD APPROVED', 'UNDER PRINCIPAL REVIEW'],
-  };
-
   if (role === 'FACULTY') {
     return ['SUBMITTED', 'UNDER FACULTY REVIEW'].includes(currentStatus);
   }
   if (role === 'HOD') {
-    return ['FACULTY APPROVED', 'UNDER HOD REVIEW'].includes(currentStatus);
+    return ['FACULTY APPROVED', 'FORWARDED TO HOD', 'UNDER HOD REVIEW'].includes(currentStatus);
   }
   if (role === 'PRINCIPAL') {
-    return ['HOD APPROVED', 'UNDER PRINCIPAL REVIEW'].includes(currentStatus);
+    return ['FORWARDED TO PRINCIPAL', 'HOD APPROVED', 'UNDER PRINCIPAL REVIEW'].includes(currentStatus);
   }
   return false;
 }
@@ -699,18 +749,26 @@ app.post('/api/requests', authenticate, requireRole('STUDENT'), upload.array('do
   const studentProfile = getStudentProfile(req.user.id);
   if (!studentProfile) return res.status(400).json({ message: 'Student profile not found.' });
   const body = req.body;
-  const { subject, description, reason, request_type_id, department_id } = body;
-  if (!subject || !description || !reason || !request_type_id) {
-    return res.status(400).json({ message: 'Subject, description, reason, and request type are required.' });
+  const { subject, description, reason, request_type_id, assigned_faculty_id } = body;
+  if (!subject || !description || !reason || !request_type_id || !assigned_faculty_id) {
+    return res.status(400).json({ message: 'Subject, description, reason, request type, and faculty recipient are required.' });
   }
   const requestType = getRequestTypeById(Number(request_type_id));
   if (!requestType) return res.status(404).json({ message: 'Request type not found.' });
-  const department = getDepartmentById(Number(department_id || studentProfile.department_id));
+  const department = getDepartmentById(studentProfile.department_id);
   if (!department) return res.status(400).json({ message: 'Department not found.' });
+  const facultyProfile = getFacultyProfile(Number(assigned_faculty_id));
+  const facultyUser = queryRow('SELECT id, name FROM users WHERE id = ? AND role = ? AND is_active = 1', [Number(assigned_faculty_id), 'FACULTY']);
+  if (!facultyProfile || !facultyUser || facultyProfile.department_id !== studentProfile.department_id) {
+    return res.status(400).json({ message: 'Choose an active faculty member from your department.' });
+  }
+  if (!getActiveHodUserId(studentProfile.department_id)) {
+    return res.status(409).json({ message: 'Your department does not have an active HOD assigned yet.' });
+  }
   const requestNumber = generateRequestNumber();
   execute(
-    'INSERT INTO requests (request_number, student_id, department_id, request_type_id, subject, description, reason, status, current_stage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    [requestNumber, studentProfile.id, department.id, requestType.id, subject, description, reason, 'SUBMITTED', 'Student'],
+    'INSERT INTO requests (request_number, student_id, department_id, request_type_id, subject, description, reason, assigned_faculty_id, current_approver_id, status, current_stage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [requestNumber, studentProfile.id, department.id, requestType.id, subject, description, reason, facultyUser.id, facultyUser.id, 'SUBMITTED', 'FACULTY'],
   );
   const request = queryRow('SELECT * FROM requests WHERE request_number = ?', [requestNumber]);
 
@@ -723,12 +781,9 @@ app.post('/api/requests', authenticate, requireRole('STUDENT'), upload.array('do
     }
   }
 
-  const studentUser = queryRow('SELECT * FROM users WHERE id = ?', [req.user.id]);
-  const faculty = queryRow('SELECT * FROM faculty WHERE department_id = ? LIMIT 1', [department.id]);
-  if (faculty) {
-    createNotification(faculty.user_id, request.id, 'New request received', `A new ${requestType.name} request was submitted by ${studentUser.name}.`);
-  }
+  createNotification(facultyUser.id, request.id, 'New request received', `${requestNumber}: ${requestType.name} request from ${req.user.name}.`);
   createNotification(req.user.id, request.id, 'Request submitted', `Your request ${requestNumber} has been submitted.`);
+  appendWorkflowHistory(request.id, req.user.id, facultyUser.id, 'FACULTY', 'SUBMITTED', '');
   logAudit(req.user.id, 'Submitted request', 'requests', request.id, null, request);
   persistDb();
 
@@ -739,24 +794,29 @@ app.get('/api/requests', authenticate, (req, res) => {
   if (req.user.role === 'STUDENT') {
     const student = getStudentProfile(req.user.id);
     const rows = queryAll('SELECT * FROM requests WHERE student_id = ? ORDER BY created_at DESC', [student.id]);
-    return res.json({ requests: rows });
+    return res.json({ requests: rows.map(buildRequestResponse) });
   }
   if (req.user.role === 'FACULTY') {
     const faculty = getFacultyProfile(req.user.id);
-    const rows = queryAll('SELECT * FROM requests WHERE department_id = ? ORDER BY created_at DESC', [faculty.department_id]);
-    return res.json({ requests: rows });
+    if (!faculty) return res.status(403).json({ message: 'Faculty profile is not assigned.' });
+    const rows = queryAll('SELECT * FROM requests WHERE assigned_faculty_id = ? ORDER BY created_at DESC', [req.user.id]);
+    return res.json({ requests: rows.map(buildRequestResponse) });
   }
   if (req.user.role === 'HOD') {
     const hod = getHodProfile(req.user.id);
-    const rows = queryAll('SELECT * FROM requests WHERE department_id = ? ORDER BY created_at DESC', [hod.department_id]);
-    return res.json({ requests: rows });
+    if (!hod) return res.status(403).json({ message: 'HOD profile is not assigned.' });
+    const rows = queryAll(
+      'SELECT * FROM requests WHERE department_id = ? AND status IN (?, ?, ?) ORDER BY created_at DESC',
+      [hod.department_id, 'FACULTY APPROVED', 'FORWARDED TO HOD', 'UNDER HOD REVIEW'],
+    );
+    return res.json({ requests: rows.map(buildRequestResponse) });
   }
   if (req.user.role === 'PRINCIPAL') {
-    const rows = queryAll('SELECT * FROM requests ORDER BY created_at DESC');
-    return res.json({ requests: rows });
+    const rows = queryAll('SELECT * FROM requests WHERE status IN (?, ?, ?) ORDER BY created_at DESC', ['FORWARDED TO PRINCIPAL', 'HOD APPROVED', 'UNDER PRINCIPAL REVIEW']);
+    return res.json({ requests: rows.map(buildRequestResponse) });
   }
   const rows = queryAll('SELECT * FROM requests ORDER BY created_at DESC');
-  return res.json({ requests: rows });
+  return res.json({ requests: rows.map(buildRequestResponse) });
 });
 
 app.get('/api/requests/:id', authenticate, (req, res) => {
@@ -777,13 +837,15 @@ function appendWorkflowHistory(requestId, fromUserId, toUserId, stage, action, r
   persistDb();
 }
 
+function isCurrentApprover(user, request) {
+  return request.current_approver_id === user.id;
+}
+
 function applyRequestDecision(request, action, remarks, user) {
-  const requestType = getRequestTypeById(request.request_type_id);
-  const department = getDepartmentById(request.department_id);
   const statusMap = {
     approve: {
       FACULTY: 'FACULTY APPROVED',
-      HOD: 'HOD APPROVED',
+      HOD: 'APPROVED',
       PRINCIPAL: 'APPROVED',
       default: 'APPROVED',
     },
@@ -807,9 +869,19 @@ function applyRequestDecision(request, action, remarks, user) {
   };
 
   const decisionStatus = statusMap[action]?.[user.role] || statusMap[action]?.default || 'SUBMITTED';
+  let nextApproverId = null;
+  let nextStage = user.role;
+  if (user.role === 'FACULTY' && ['approve', 'forward'].includes(action)) {
+    nextApproverId = getActiveHodUserId(request.department_id);
+    nextStage = 'HOD';
+  } else if (user.role === 'HOD' && action === 'forward') {
+    nextApproverId = getActivePrincipalUserId();
+    nextStage = 'PRINCIPAL';
+  }
+  const completedAt = ['REJECTED', 'APPROVED'].includes(decisionStatus) ? new Date().toISOString() : null;
   execute(
-    'UPDATE requests SET status = ?, current_stage = ?, updated_at = ? WHERE id = ?',
-    [decisionStatus, user.role, new Date().toISOString(), request.id],
+    'UPDATE requests SET status = ?, current_stage = ?, current_approver_id = ?, completed_at = ?, updated_at = ? WHERE id = ?',
+    [decisionStatus, nextStage, nextApproverId, completedAt, new Date().toISOString(), request.id],
   );
 
   execute(
@@ -817,11 +889,20 @@ function applyRequestDecision(request, action, remarks, user) {
     [request.id, user.id, user.role, action.toUpperCase(), remarks || '', new Date().toISOString()],
   );
 
-  appendWorkflowHistory(request.id, user.id, user.id, user.role, action.toUpperCase(), remarks || '');
+  appendWorkflowHistory(request.id, user.id, nextApproverId, nextStage, action.toUpperCase(), remarks || '');
 
   const requestOwner = queryRow('SELECT * FROM users WHERE id = ?', [queryRow('SELECT * FROM students WHERE id = ?', [request.student_id]).user_id]);
   const title = `Request ${action}`;
   createNotification(requestOwner.id, request.id, title, `Your request ${request.request_number} has been ${decisionStatus.toLowerCase()}.`);
+  if (nextApproverId) {
+    const nextApprover = queryRow('SELECT role FROM users WHERE id = ?', [nextApproverId]);
+    createNotification(
+      nextApproverId,
+      request.id,
+      'Request awaiting your review',
+      `${request.request_number} was reviewed by ${user.name} and is now waiting for ${nextApprover.role} review.`,
+    );
+  }
   logAudit(user.id, `${action} request`, 'requests', request.id, request.status, decisionStatus);
   persistDb();
 
@@ -834,8 +915,12 @@ app.post('/api/requests/:id/approve', authenticate, (req, res) => {
   if (!canAccessRequest(req.user, request)) return res.status(403).json({ message: 'You do not have access to approve this request.' });
 
   if (req.user.role === 'STUDENT') return res.status(403).json({ message: 'Students cannot approve requests.' });
+  if (!isCurrentApprover(req.user, request)) return res.status(403).json({ message: 'This request is not currently assigned to you.' });
   const allowed = isTransitionAllowed(request.status, 'approve', req.user.role);
   if (!allowed) return res.status(400).json({ message: `Role ${req.user.role} cannot approve this request in status ${request.status}.` });
+  if (req.user.role === 'FACULTY' && !getActiveHodUserId(request.department_id)) {
+    return res.status(409).json({ message: 'No active HOD is assigned to this department.' });
+  }
 
   const updated = applyRequestDecision(request, 'approve', req.body.remarks || '', req.user);
   return res.json({ request: updated, message: `Request approved by ${req.user.role}.` });
@@ -846,6 +931,7 @@ app.post('/api/requests/:id/reject', authenticate, (req, res) => {
   if (!request) return res.status(404).json({ message: 'Request not found.' });
   if (!canAccessRequest(req.user, request)) return res.status(403).json({ message: 'You cannot reject this request.' });
   if (req.user.role === 'STUDENT') return res.status(403).json({ message: 'Students cannot reject requests.' });
+  if (!isCurrentApprover(req.user, request)) return res.status(403).json({ message: 'This request is not currently assigned to you.' });
   const allowed = isTransitionAllowed(request.status, 'reject', req.user.role);
   if (!allowed) return res.status(400).json({ message: `Role ${req.user.role} cannot reject this request in status ${request.status}.` });
 
@@ -858,6 +944,7 @@ app.post('/api/requests/:id/return', authenticate, (req, res) => {
   if (!request) return res.status(404).json({ message: 'Request not found.' });
   if (!canAccessRequest(req.user, request)) return res.status(403).json({ message: 'You cannot return this request.' });
   if (req.user.role === 'STUDENT') return res.status(403).json({ message: 'Students cannot return requests.' });
+  if (!isCurrentApprover(req.user, request)) return res.status(403).json({ message: 'This request is not currently assigned to you.' });
   const allowed = isTransitionAllowed(request.status, 'return', req.user.role);
   if (!allowed) return res.status(400).json({ message: `Role ${req.user.role} cannot return this request in status ${request.status}.` });
 
@@ -870,8 +957,15 @@ app.post('/api/requests/:id/forward', authenticate, (req, res) => {
   if (!request) return res.status(404).json({ message: 'Request not found.' });
   if (!canAccessRequest(req.user, request)) return res.status(403).json({ message: 'You cannot forward this request.' });
   if (req.user.role === 'STUDENT') return res.status(403).json({ message: 'Students cannot forward requests.' });
+  if (!isCurrentApprover(req.user, request)) return res.status(403).json({ message: 'This request is not currently assigned to you.' });
   const allowed = isTransitionAllowed(request.status, 'forward', req.user.role);
   if (!allowed) return res.status(400).json({ message: `Role ${req.user.role} cannot forward this request in status ${request.status}.` });
+  if (req.user.role === 'FACULTY' && !getActiveHodUserId(request.department_id)) {
+    return res.status(409).json({ message: 'No active HOD is assigned to this department.' });
+  }
+  if (req.user.role === 'HOD' && !getActivePrincipalUserId()) {
+    return res.status(409).json({ message: 'No active Principal account is available.' });
+  }
 
   const updated = applyRequestDecision(request, 'forward', req.body.remarks || '', req.user);
   return res.json({ request: updated, message: `Request forwarded by ${req.user.role}.` });
@@ -894,6 +988,9 @@ app.get('/api/requests/:id/pdf', authenticate, async (req, res) => {
   const user = queryRow('SELECT * FROM users WHERE id = ?', [student.user_id]);
   const department = queryRow('SELECT * FROM departments WHERE id = ?', [request.department_id]);
   const type = queryRow('SELECT * FROM request_types WHERE id = ?', [request.request_type_id]);
+  const facultyRecipient = request.assigned_faculty_id
+    ? queryRow('SELECT name, designation FROM users u LEFT JOIN faculty f ON f.user_id = u.id WHERE u.id = ?', [request.assigned_faculty_id])
+    : null;
 
   const doc = new PDFDocument({ margin: 50 });
   const fileName = `${request.request_number}.pdf`;
@@ -904,7 +1001,9 @@ app.get('/api/requests/:id/pdf', authenticate, async (req, res) => {
   doc.moveDown();
   doc.fontSize(14).text('Permission Request Letter', { align: 'center' });
   doc.moveDown(2);
-  doc.fontSize(12).text(`To\nThe Head of the Department\n${department.department_name}\nABC College`);
+  doc.fontSize(12).text(
+    `To\n${facultyRecipient ? `${facultyRecipient.name}${facultyRecipient.designation ? `, ${facultyRecipient.designation}` : ''}\n` : ''}The Head of the Department\n${department.department_name}\nABC College`,
+  );
   doc.moveDown();
   doc.text(`Subject: ${request.subject}`);
   doc.moveDown();
@@ -1048,6 +1147,102 @@ if (!seeded) {
   }
 
   persistDb();
+}
+
+function ensureDemoDepartmentStaff(departmentCode, departmentName, hodName, hodEmail, facultyName, facultyEmail, employeePrefix) {
+  let department = queryRow('SELECT * FROM departments WHERE department_code = ?', [departmentCode]);
+  if (!department) {
+    execute(
+      'INSERT INTO departments (department_code, department_name, is_active) VALUES (?, ?, 1)',
+      [departmentCode, departmentName],
+    );
+    department = queryRow('SELECT * FROM departments WHERE department_code = ?', [departmentCode]);
+  }
+
+  let hodUser = queryRow('SELECT * FROM users WHERE email = ?', [hodEmail]);
+  if (!hodUser) {
+    execute(
+      'INSERT INTO users (name, email, phone, password_hash, role, department_id, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)',
+      [hodName, hodEmail, '', hashPassword('Hod@123'), 'HOD', department.id],
+    );
+    hodUser = queryRow('SELECT * FROM users WHERE email = ?', [hodEmail]);
+  }
+  const hodProfile = queryRow('SELECT id FROM hods WHERE user_id = ?', [hodUser.id]);
+  if (!hodProfile) {
+    execute(
+      'INSERT INTO hods (user_id, employee_id, department_id, designation, is_active) VALUES (?, ?, ?, ?, 1)',
+      [hodUser.id, `${employeePrefix}-HOD`, department.id, 'Head of Department'],
+    );
+  } else {
+    execute('UPDATE hods SET department_id = ? WHERE user_id = ?', [department.id, hodUser.id]);
+  }
+  execute('UPDATE users SET department_id = ? WHERE id = ?', [department.id, hodUser.id]);
+  execute('UPDATE departments SET hod_id = ? WHERE id = ?', [hodUser.id, department.id]);
+
+  let facultyUser = queryRow('SELECT * FROM users WHERE email = ?', [facultyEmail]);
+  if (!facultyUser) {
+    execute(
+      'INSERT INTO users (name, email, phone, password_hash, role, department_id, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)',
+      [facultyName, facultyEmail, '', hashPassword('Faculty@123'), 'FACULTY', department.id],
+    );
+    facultyUser = queryRow('SELECT * FROM users WHERE email = ?', [facultyEmail]);
+  }
+  const facultyProfile = queryRow('SELECT id FROM faculty WHERE user_id = ?', [facultyUser.id]);
+  if (!facultyProfile) {
+    execute(
+      'INSERT INTO faculty (user_id, employee_id, department_id, designation, is_class_incharge) VALUES (?, ?, ?, ?, 1)',
+      [facultyUser.id, `${employeePrefix}-FAC`, department.id, 'Class In-charge'],
+    );
+  } else {
+    execute('UPDATE faculty SET department_id = ? WHERE user_id = ?', [department.id, facultyUser.id]);
+  }
+  execute('UPDATE users SET department_id = ? WHERE id = ?', [department.id, facultyUser.id]);
+}
+
+for (const staff of [
+  ['EEE', 'Electrical & Electronics', 'Dr. Kavita Rao', 'hod.eee@abccollege.edu', 'Prof. Suresh Kumar', 'faculty.eee1@abccollege.edu', 'EEE'],
+  ['MECH', 'Mechanical Engineering', 'Dr. Rahul Menon', 'hod.mech@abccollege.edu', 'Prof. Maya Das', 'faculty.mech1@abccollege.edu', 'MECH'],
+  ['CIVIL', 'Civil Engineering', 'Dr. Anita Bose', 'hod.civil@abccollege.edu', 'Prof. Arvind Shah', 'faculty.civil1@abccollege.edu', 'CIVIL'],
+  ['CSE-DS', 'CSE - Data Science', 'Dr. Neha Kulkarni', 'hod.csedatascience@abccollege.edu', 'Prof. Ishan Rao', 'faculty.csedatascience@abccollege.edu', 'CSEDS'],
+]) {
+  ensureDemoDepartmentStaff(...staff);
+}
+
+execute(
+  `UPDATE requests
+   SET assigned_faculty_id = (
+     SELECT f.user_id FROM faculty f JOIN users u ON u.id = f.user_id
+     WHERE f.department_id = requests.department_id AND u.is_active = 1
+     ORDER BY f.is_class_incharge DESC, f.id LIMIT 1
+   )
+   WHERE assigned_faculty_id IS NULL
+     AND status IN ('SUBMITTED', 'UNDER FACULTY REVIEW')`,
+);
+execute(
+  `UPDATE requests
+   SET current_approver_id = CASE
+     WHEN status IN ('SUBMITTED', 'UNDER FACULTY REVIEW') THEN assigned_faculty_id
+     WHEN status IN ('FACULTY APPROVED', 'FORWARDED TO HOD', 'UNDER HOD REVIEW') THEN (
+       SELECT h.user_id FROM hods h JOIN users u ON u.id = h.user_id
+       WHERE h.department_id = requests.department_id AND h.is_active = 1 AND u.is_active = 1
+       ORDER BY h.id LIMIT 1
+     )
+     WHEN status IN ('FORWARDED TO PRINCIPAL', 'HOD APPROVED', 'UNDER PRINCIPAL REVIEW') THEN (
+       SELECT id FROM users WHERE role = 'PRINCIPAL' AND is_active = 1 ORDER BY id LIMIT 1
+     )
+     ELSE current_approver_id
+   END
+   WHERE current_approver_id IS NULL`,
+);
+persistDb();
+
+if (process.env.NODE_ENV === 'production') {
+  const frontendBuild = path.join(workspaceRoot, 'frontend', 'dist');
+  app.use(express.static(frontendBuild));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api/')) return next();
+    return res.sendFile(path.join(frontendBuild, 'index.html'));
+  });
 }
 
 app.use((err, _req, res, _next) => {
